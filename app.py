@@ -69,7 +69,7 @@ def search_shorts(
     max_results: int = Query(100, ge=1, le=200),
     days: int = Query(90, ge=1, le=180),
     order: str = Query("views"),
-    shorts_only: bool = Query(True, description="쇼츠만 보기(≤60초)")
+    shorts_only: bool = Query(True, description="쇼츠만 보기(≤180초)")
 ):
     yt = get_youtube()
     published_after = (datetime.utcnow() - timedelta(days=days)).isoformat("T") + "Z"
@@ -103,7 +103,7 @@ def search_shorts(
 
         for v in vresp.get("items", []):
             dur = isodate.parse_duration(v["contentDetails"]["duration"]).total_seconds()
-            if shorts_only and dur > 60:
+            if shorts_only and dur > 180:
                 continue
             videos.append({
                 "videoId": v["id"],
