@@ -1,4 +1,4 @@
-# app.py — YouTube Shorts Analyzer (v1.3, 쇼츠 길이 가변)
+# app.py — YouTube Shorts Analyzer (v1.4, 한글 시트/링크/바이럴 점수)
 from fastapi import FastAPI, Query, Body, HTTPException
 from typing import List, Dict, Any, Union
 from datetime import datetime, timedelta
@@ -61,7 +61,7 @@ def health():
     return {"ok": True, "time": datetime.utcnow().isoformat()}
 
 # =========================
-# 1️⃣ 유튜브 쇼츠 검색 API
+# 1) 유튜브 쇼츠 검색 (길이 가변)
 # =========================
 @app.get("/api/search_shorts")
 def search_shorts(
@@ -73,15 +73,13 @@ def search_shorts(
     max_duration_sec: int = Query(180, ge=1, le=600, description="쇼츠로 인정할 최대 길이(초), 기본 180")
 ):
     """
-    쇼츠 판별 로직:
-    - shorts_only = True 일 때, durationSec <= max_duration_sec 인 영상만 반환
-    - 기본값 180초(3분)
+    - shorts_only=True이면 durationSec <= max_duration_sec 인 영상만 반환
     """
     yt = get_youtube()
     published_after = (datetime.utcnow() - timedelta(days=days)).isoformat("T") + "Z"
     order_api = ORDER_MAP.get(order, "viewCount")
 
-    # 1) 검색으로 videoId 모으기
+    # 1) 검색으로 videoId 수집
     video_ids: List[str] = []
     next_page_token = None
     while len(video_ids) < max_results:
@@ -92,7 +90,6 @@ def search_shorts(
             maxResults=min(50, max_results - len(video_ids)),
             pageToken=next_page_token
         ).execute()
-
         ids = [it["id"]["videoId"] for it in resp.get("items", [])]
         video_ids += ids
         next_page_token = resp.get("nextPageToken")
@@ -100,14 +97,13 @@ def search_shorts(
             break
 
     if not video_ids:
-        return {"keyword": q, "count": 0, "videos": []}
+        return {"keyword": q, "count": 0, "shorts_only": shorts_only, "max_duration_sec": max_duration_sec, "videos": []}
 
-    # 2) 세부 정보 조회 + 길이 필터
+    # 2) 세부 정보 + 길이 필터
     videos: List[Dict[str, Any]] = []
     for i in range(0, len(video_ids), 50):
         chunk = ",".join(video_ids[i:i+50])
         vresp = yt.videos().list(id=chunk, part="snippet,contentDetails,statistics").execute()
-
         for v in vresp.get("items", []):
             dur = isodate.parse_duration(v["contentDetails"]["duration"]).total_seconds()
             if shorts_only and dur > max_duration_sec:
@@ -126,7 +122,7 @@ def search_shorts(
             })
 
     if not videos:
-        return {"keyword": q, "count": 0, "videos": []}
+        return {"keyword": q, "count": 0, "shorts_only": shorts_only, "max_duration_sec": max_duration_sec, "videos": []}
 
     # 3) 채널 구독자 수 조회
     ch_ids = sorted({v["channelId"] for v in videos})
@@ -138,7 +134,7 @@ def search_shorts(
             s = c.get("statistics", {})
             subs_map[c["id"]] = None if s.get("hiddenSubscriberCount") else int(s.get("subscriberCount", 0))
 
-    # 4) 계산 필드 추가
+    # 4) 계산 필드(구독자 대비 조회/좋아요)
     for v in videos:
         sub = subs_map.get(v["channelId"])
         v["subscriberCount"] = sub
@@ -151,6 +147,7 @@ def search_shorts(
 
     # 5) 기본 정렬(조회수 내림차순)
     videos.sort(key=lambda x: x["viewCount"], reverse=True)
+
     return {
         "keyword": q,
         "count": len(videos),
@@ -160,47 +157,101 @@ def search_shorts(
     }
 
 # =========================
-# 2️⃣ Google Sheets 업로드 (rows / videos / 배열 모두 지원)
+# 2) Google Sheets 업로드 (한글 헤더/날짜/링크/바이럴 점수)
 # =========================
 @app.post("/api/export/sheets")
 def export_to_sheets(payload: Union[Dict[str, Any], List[Dict[str, Any]]] = Body(...)):
-    # 1) 배열로만 온 경우
+    """
+    허용하는 입력 형태:
+    - 배열만: [ {...}, {...} ]  -> rows로 간주
+    - 객체: { "rows": [...], "keyword": "스포츠", "sheetName": "스포츠_YYYYMMDD" }
+    - 객체: { "videos": [...] , "keyword": "스포츠" } 도 허용
+    """
+    # rows 추출
     if isinstance(payload, list):
         rows = payload
         keyword = "검색결과"
         sheet_name = f"{keyword}_{datetime.utcnow().strftime('%Y%m%d')}"
     else:
-        # 2) rows 또는 videos 둘 다 허용
         rows = payload.get("rows") or payload.get("videos") or []
         keyword = payload.get("keyword") or "검색결과"
         sheet_name = payload.get("sheetName") or f"{keyword}_{datetime.utcnow().strftime('%Y%m%d')}"
 
     if not rows:
         raise HTTPException(status_code=400, detail="rows 가 비어있습니다.")
-
     if not (GOOGLE_SA_JSON and SHEETS_PARENT_SPREADSHEET_ID):
         raise HTTPException(status_code=500, detail="시트 업로드용 환경변수(GOOGLE_SA_JSON, SHEETS_PARENT_SPREADSHEET_ID)가 필요합니다.")
 
     sheets = get_sheets_service()
 
-    headers = [
-        "channelTitle", "videoTitle", "publishedAt",
-        "subscriberCount", "viewCount", "viewsPerSub",
-        "likeCount", "likesPerSub", "commentCount",
-        "watchUrl", "videoId", "durationSec", "channelId"
+    # === 한글 헤더(요청한 매핑) + 바이럴 점수 ===
+    headers_ko = [
+        "채널명", "영상제목", "업로드날짜",
+        "구독자 수", "조회수", "구독자 당 조회수",
+        "구독자 당 좋아요", "좋아요 수", "댓글 수",
+        "영상 링크", "바이럴 점수"
     ]
 
-    values = [headers]
-    for r in rows:
-        row = []
-        for h in headers:
-            val = r.get(h, "")
-            if isinstance(val, float):
-                val = round(val, 6)
-            row.append(str(val))
-        values.append(row)
+    # 보조: ISO8601 -> YYYY-MM-DD
+    def to_yyyy_mm_dd(ts: str) -> str:
+        if not ts:
+            return ""
+        # '2025-10-21T05:30:00Z' 형태 지원
+        if ts.endswith("Z"):
+            ts = ts.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(ts).strftime("%Y-%m-%d")
+        except Exception:
+            return ts  # 파싱 실패 시 원문 유지
 
-    # 시트 탭 만들기 (중복 시 무시)
+    # 보조: 시트 HYPERLINK 수식 만들기 (=HYPERLINK("url","텍스트"))
+    def hyperlink(url: str, text: str) -> str:
+        if not url:
+            return ""
+        safe_text = (text or "").replace('"', '""')  # 따옴표 이스케이프
+        safe_url = (url or "").replace('"', '""')
+        return f'=HYPERLINK("{safe_url}","{safe_text}")'
+
+    # 보조: 바이럴 점수 계산 (가중치 예시)
+    # - viewsPerSub * 0.7 + likesPerSub * 300
+    def viral_score(row: Dict[str, Any]) -> float:
+        vps = row.get("viewsPerSub") or 0.0
+        lps = row.get("likesPerSub") or 0.0
+        score = vps * 0.7 + lps * 300.0
+        return round(float(score), 4)
+
+    # rows -> 한글 컬럼 순서로 변환 + 가공(날짜/링크/점수)
+    values = [headers_ko]
+    for r in rows:
+        channelTitle   = r.get("channelTitle", "")
+        videoTitle     = r.get("videoTitle", "")
+        publishedAt    = to_yyyy_mm_dd(r.get("publishedAt", ""))
+        subscriberCnt  = r.get("subscriberCount", "")
+        viewCount      = r.get("viewCount", "")
+        viewsPerSub    = "" if r.get("viewsPerSub") is None else r.get("viewsPerSub")
+        likesPerSub    = "" if r.get("likesPerSub") is None else r.get("likesPerSub")
+        likeCount      = r.get("likeCount", "")
+        commentCount   = r.get("commentCount", "")
+        watchUrl       = r.get("watchUrl", "")
+
+        link_formula   = hyperlink(watchUrl, videoTitle)
+        viralScore     = viral_score(r)
+
+        values.append([
+            str(channelTitle),
+            str(videoTitle),
+            str(publishedAt),
+            str(subscriberCnt),
+            str(viewCount),
+            str(viewsPerSub),
+            str(likesPerSub),
+            str(likeCount),
+            str(commentCount),
+            link_formula,          # 수식 그대로 기록
+            str(viralScore)
+        ])
+
+    # 시트 탭 생성(이미 있으면 무시)
     try:
         sheets.spreadsheets().batchUpdate(
             spreadsheetId=SHEETS_PARENT_SPREADSHEET_ID,
@@ -209,6 +260,7 @@ def export_to_sheets(payload: Union[Dict[str, Any], List[Dict[str, Any]]] = Body
     except Exception:
         pass
 
+    # 값 기록 (RAW로 보내도 HYPERLINK 수식은 정상 동작)
     sheets.spreadsheets().values().update(
         spreadsheetId=SHEETS_PARENT_SPREADSHEET_ID,
         range=f"{sheet_name}!A1",
