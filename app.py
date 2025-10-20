@@ -1,4 +1,4 @@
-# app.py — YouTube Shorts Analyzer (v1.1 안정버전)
+# app.py — YouTube Shorts Analyzer (v1.2 완성본)
 from fastapi import FastAPI, Query, Body, HTTPException
 from typing import List, Dict, Any, Union
 from datetime import datetime, timedelta
@@ -12,9 +12,9 @@ app = FastAPI(title="YouTube Shorts Analyzer (MVP)")
 # =========================
 # 환경변수
 # =========================
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")  # 필수
-SHEETS_PARENT_SPREADSHEET_ID = os.getenv("SHEETS_PARENT_SPREADSHEET_ID")  # 선택
-GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")  # 선택
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+SHEETS_PARENT_SPREADSHEET_ID = os.getenv("SHEETS_PARENT_SPREADSHEET_ID")
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")
 
 # =========================
 # 외부 서비스 연결 함수
@@ -145,17 +145,18 @@ def search_shorts(
     return {"keyword": q, "count": len(videos), "videos": videos}
 
 # =========================
-# 2️⃣ Google Sheets 업로드
+# 2️⃣ Google Sheets 업로드 (rows / videos / 배열 모두 지원)
 # =========================
 @app.post("/api/export/sheets")
 def export_to_sheets(payload: Union[Dict[str, Any], List[Dict[str, Any]]] = Body(...)):
-    # 배열만 보내도 rows로 간주
+    # 1) 배열로만 온 경우
     if isinstance(payload, list):
         rows = payload
         keyword = "검색결과"
         sheet_name = f"{keyword}_{datetime.utcnow().strftime('%Y%m%d')}"
     else:
-        rows = payload.get("rows") or []
+        # 2) rows 또는 videos 둘 다 허용
+        rows = payload.get("rows") or payload.get("videos") or []
         keyword = payload.get("keyword") or "검색결과"
         sheet_name = payload.get("sheetName") or f"{keyword}_{datetime.utcnow().strftime('%Y%m%d')}"
 
