@@ -1,4 +1,4 @@
-# app.py — YouTube Shorts Analyzer (v1.4, 한글 시트/링크/바이럴 점수)
+# app.py — YouTube Shorts Analyzer (v1.5, 균형형 점수/한글 시트/순수 링크)
 from fastapi import FastAPI, Query, Body, HTTPException
 from typing import List, Dict, Any, Union
 from datetime import datetime, timedelta
@@ -157,7 +157,7 @@ def search_shorts(
     }
 
 # =========================
-# 2) Google Sheets 업로드 (한글 헤더/날짜/링크/바이럴 점수)
+# 2) Google Sheets 업로드 (한글 헤더/날짜/순수 URL/바이럴 점수)
 # =========================
 @app.post("/api/export/sheets")
 def export_to_sheets(payload: Union[Dict[str, Any], List[Dict[str, Any]]] = Body(...)):
@@ -196,7 +196,6 @@ def export_to_sheets(payload: Union[Dict[str, Any], List[Dict[str, Any]]] = Body
     def to_yyyy_mm_dd(ts: str) -> str:
         if not ts:
             return ""
-        # '2025-10-21T05:30:00Z' 형태 지원
         if ts.endswith("Z"):
             ts = ts.replace("Z", "+00:00")
         try:
@@ -204,23 +203,15 @@ def export_to_sheets(payload: Union[Dict[str, Any], List[Dict[str, Any]]] = Body
         except Exception:
             return ts  # 파싱 실패 시 원문 유지
 
-    # 보조: 시트 HYPERLINK 수식 만들기 (=HYPERLINK("url","텍스트"))
-    def hyperlink(url: str, text: str) -> str:
-        if not url:
-            return ""
-        safe_text = (text or "").replace('"', '""')  # 따옴표 이스케이프
-        safe_url = (url or "").replace('"', '""')
-        return f'=HYPERLINK("{safe_url}","{safe_text}")'
-
-    # 보조: 바이럴 점수 계산 (가중치 예시)
-    # - viewsPerSub * 0.7 + likesPerSub * 300
+    # 보조: 바이럴 점수 계산 (균형형 60:40)
+    # - 조회 효율 60% (계수 0.6), 좋아요 효율 40% (스케일 보정 계수 400)
     def viral_score(row: Dict[str, Any]) -> float:
         vps = row.get("viewsPerSub") or 0.0
         lps = row.get("likesPerSub") or 0.0
-        score = vps * 0.7 + lps * 300.0
+        score = vps * 0.6 + lps * 400.0
         return round(float(score), 4)
 
-    # rows -> 한글 컬럼 순서로 변환 + 가공(날짜/링크/점수)
+    # rows -> 한글 컬럼 순서로 변환 + 가공(날짜/점수/링크=순수URL)
     values = [headers_ko]
     for r in rows:
         channelTitle   = r.get("channelTitle", "")
@@ -232,9 +223,7 @@ def export_to_sheets(payload: Union[Dict[str, Any], List[Dict[str, Any]]] = Body
         likesPerSub    = "" if r.get("likesPerSub") is None else r.get("likesPerSub")
         likeCount      = r.get("likeCount", "")
         commentCount   = r.get("commentCount", "")
-        watchUrl       = r.get("watchUrl", "")
-
-        link_formula   = hyperlink(watchUrl, videoTitle)
+        watchUrl       = r.get("watchUrl", "")  # 순수 URL 유지
         viralScore     = viral_score(r)
 
         values.append([
@@ -247,7 +236,7 @@ def export_to_sheets(payload: Union[Dict[str, Any], List[Dict[str, Any]]] = Body
             str(likesPerSub),
             str(likeCount),
             str(commentCount),
-            link_formula,          # 수식 그대로 기록
+            str(watchUrl),     # =HYPERLINK 수식 대신 순수 URL
             str(viralScore)
         ])
 
@@ -260,7 +249,7 @@ def export_to_sheets(payload: Union[Dict[str, Any], List[Dict[str, Any]]] = Body
     except Exception:
         pass
 
-    # 값 기록 (RAW로 보내도 HYPERLINK 수식은 정상 동작)
+    # 값 기록
     sheets.spreadsheets().values().update(
         spreadsheetId=SHEETS_PARENT_SPREADSHEET_ID,
         range=f"{sheet_name}!A1",
