@@ -239,7 +239,7 @@ def export_to_sheets(payload: Union[Dict[str, Any], List[Dict[str, Any]]] = Body
     sheets.spreadsheets().values().update(
         spreadsheetId=SHEETS_PARENT_SPREADSHEET_ID,
         range=f"{sheet_name}!A1",
-        valueInputOption="RAW",
+        valueInputOption="USER_ENTERED",
         body={"values": values}
     ).execute()
 
