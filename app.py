@@ -1,15 +1,17 @@
-# app.py — YouTube Shorts Analyzer (v2.0 통합본)
-# - /docs 에서 / 와 /health 숨김
-# - GET /api/search_shorts 실행 시 결과를 자동으로 Google Sheets 업로드
-# - POST /api/export/sheets 는 수동 업로드용(여전히 사용 가능)
-# - 시트: 한글 헤더, 날짜 YYYY-MM-DD, 제목은 텍스트(링크 없음), '영상 링크'는 순수 URL
-# - 바이럴 점수: viewsPerSub*0.6 + likesPerSub*400 (조회 60%, 좋아요 40%)
-# - 길이 제한 파라미터 max_duration_sec 기본 180초
+# app.py — YouTube Shorts Analyzer (v2.1, webhook 통합본)
+# - /docs에서 /, /health 숨김
+# - GET /api/search_shorts: 실행 시 자동 Google Sheets 업로드 (auto_sheet 기본 True)
+# - POST /api/export/sheets: 수동 업로드용
+# - GET /api/quick: 한 줄 명령(cmd) 또는 개별 파라미터로 검색→시트 업로드
+# - POST /api/quick_webhook: GPT(또는 봇)가 토큰으로 안전하게 호출하는 비공개 엔드포인트
+# - 시트: 한글 헤더, YYYY-MM-DD, 제목=텍스트, 영상 링크=순수 URL
+# - 바이럴 점수: viewsPerSub*0.6 + likesPerSub*400
+# - 쇼츠 길이 제한 파라미터 max_duration_sec (기본 180초)
 
-from fastapi import FastAPI, Query, Body, HTTPException
-from typing import List, Dict, Any, Union, Optional
+from fastapi import FastAPI, Query, Body, HTTPException, Header
+from typing import List, Dict, Any, Union, Optional, Tuple
 from datetime import datetime, timedelta
-import os, json, isodate
+import os, json, re, hmac, isodate
 
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
@@ -22,6 +24,7 @@ app = FastAPI(title="YouTube Shorts Analyzer (MVP)")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 SHEETS_PARENT_SPREADSHEET_ID = os.getenv("SHEETS_PARENT_SPREADSHEET_ID")
 GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")  # ✅ 새로 추가(필수: webhook 사용 시)
 
 # =========================
 # 외부 서비스 연결
@@ -84,7 +87,7 @@ def viral_score(row: Dict[str, Any]) -> float:
     return round(vps * 0.6 + lps * 400.0, 4)
 
 def export_rows_to_sheets(rows: List[Dict[str, Any]], keyword: str, sheet_name: Optional[str] = None) -> Dict[str, Any]:
-    """시트 업로드 공통함수: 한글 헤더/날짜 변환/링크 순수 URL/제목 텍스트/바이럴 점수"""
+    """시트 업로드: 한글 헤더/날짜 변환/링크 순수 URL/제목 텍스트/바이럴 점수"""
     if not rows:
         raise HTTPException(status_code=400, detail="rows 가 비어있습니다.")
     if not (GOOGLE_SA_JSON and SHEETS_PARENT_SPREADSHEET_ID):
@@ -111,7 +114,7 @@ def export_rows_to_sheets(rows: List[Dict[str, Any]], keyword: str, sheet_name: 
         likesPerSub  = "" if r.get("likesPerSub") is None else r.get("likesPerSub")
         likeCount    = r.get("likeCount", "")
         commentCount = r.get("commentCount", "")
-        watchUrl     = r.get("watchUrl", "")     # 순수 URL만
+        watchUrl     = r.get("watchUrl", "")     # 순수 URL
         score        = viral_score(r)
 
         values.append([
@@ -151,6 +154,27 @@ def export_rows_to_sheets(rows: List[Dict[str, Any]], keyword: str, sheet_name: 
         "sheet_name": sheet_name,
         "rows": len(rows)
     }
+
+def parse_cmd(text: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
+    """'키워드 / 결과수 / days / 길이' 형식 파싱. / , | 구분자 허용."""
+    parts = [p.strip() for p in re.split(r"[\/,\|]+", text or "") if p.strip()]
+    kw = parts[0] if len(parts) >= 1 else None
+    def to_int(s): 
+        try:
+            return int(s)
+        except:
+            return None
+    _n   = to_int(parts[1]) if len(parts) >= 2 else None
+    _day = to_int(parts[2]) if len(parts) >= 3 else None
+    _dur = to_int(parts[3]) if len(parts) >= 4 else None
+    return kw, _n, _day, _dur
+
+def check_token(provided: Optional[str]) -> None:
+    """Webhook 토큰 검증(상수시간 비교)."""
+    if not WEBHOOK_TOKEN:
+        raise HTTPException(status_code=500, detail="WEBHOOK_TOKEN 환경변수가 설정되지 않았습니다.")
+    if not provided or not hmac.compare_digest(provided, WEBHOOK_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 # =========================
 # 1) 유튜브 쇼츠 검색 + 자동 업로드(단일 단계)
@@ -224,7 +248,7 @@ def search_and_export(
             s = c.get("statistics", {})
             subs_map[c["id"]] = None if s.get("hiddenSubscriberCount") else int(s.get("subscriberCount", 0))
 
-    # 4) 계산 필드(구독자 대비 조회/좋아요)
+    # 4) 계산 필드
     for v in videos:
         sub = subs_map.get(v["channelId"])
         v["subscriberCount"] = sub
@@ -235,12 +259,10 @@ def search_and_export(
             v["viewsPerSub"] = None
             v["likesPerSub"] = None
 
-    # 5) 정렬(조회수 내림차순)
     videos.sort(key=lambda x: x["viewCount"], reverse=True)
 
     result = {"keyword": q, "count": len(videos), "videos": videos}
 
-    # 6) 자동 업로드
     if auto_sheet:
         sheet_res = export_rows_to_sheets(rows=videos, keyword=q)
         result["sheet"] = sheet_res
@@ -249,8 +271,7 @@ def search_and_export(
     return result
 
 # =========================
-# 2) 수동 업로드 엔드포인트(선택)
-#    - rows / videos / 배열 그대로 모두 허용
+# 2) 수동 업로드 (선택)
 # =========================
 @app.post("/api/export/sheets")
 def export_to_sheets(payload: Union[Dict[str, Any], List[Dict[str, Any]]] = Body(...)):
@@ -262,5 +283,82 @@ def export_to_sheets(payload: Union[Dict[str, Any], List[Dict[str, Any]]] = Body
         rows = payload.get("rows") or payload.get("videos") or []
         keyword = payload.get("keyword") or "검색결과"
         sheet_name = payload.get("sheetName")
-
     return export_rows_to_sheets(rows=rows, keyword=keyword, sheet_name=sheet_name)
+
+# =========================
+# 3) 빠른 명령형 호출 (공개)
+# =========================
+@app.get("/api/quick")
+def quick(
+    cmd: Optional[str] = Query(
+        None,
+        description='형식: "키워드 / 결과수 / days / 길이" 예) 이재명 / 30 / 30 / 180'
+    ),
+    q: Optional[str] = Query(None, description="키워드"),
+    n: Optional[int] = Query(None, ge=1, le=200, description="결과수"),
+    days: Optional[int] = Query(None, ge=1, le=180, description="기간(일)"),
+    duration: Optional[int] = Query(None, ge=1, le=600, description="최대 길이(초)")
+):
+    if cmd:
+        _q, _n, _days, _dur = parse_cmd(cmd)
+        if _q: q = _q
+        if _n: n = _n
+        if _days: days = _days
+        if _dur: duration = _dur
+
+    q = q or "검색결과"
+    n = n or 100
+    days = days or 90
+    duration = duration or 180
+
+    return search_and_export(
+        q=q,
+        max_results=n,
+        days=days,
+        order="views",
+        shorts_only=True,
+        max_duration_sec=duration,
+        auto_sheet=True
+    )
+
+# =========================
+# 4) Webhook 전용(비공개) — GPT/봇이 토큰으로 호출
+# =========================
+@app.post("/api/quick_webhook", include_in_schema=False)
+def quick_webhook(
+    token: Optional[str] = Query(None, description="쿼리 토큰 (또는 X-Webhook-Token 헤더 사용)"),
+    x_token: Optional[str] = Header(None, convert_underscores=False, alias="X-Webhook-Token"),
+    payload: Optional[Dict[str, Any]] = Body(None)
+):
+    # 토큰 인증
+    provided = token or (payload.get("token") if payload else None) or x_token
+    check_token(provided)
+
+    # 입력 파싱: cmd 우선, 개별 파라미터 보조
+    cmd = payload.get("cmd") if payload else None
+    q   = payload.get("q") if payload else None
+    n   = payload.get("n") if payload else None
+    days= payload.get("days") if payload else None
+    dur = payload.get("duration") if payload else None
+
+    if cmd:
+        _q, _n, _days, _dur = parse_cmd(cmd)
+        if _q: q = _q
+        if _n: n = _n
+        if _days: days = _days
+        if _dur: dur = _dur
+
+    q   = q or "검색결과"
+    n   = int(n) if n else 100
+    days= int(days) if days else 90
+    dur = int(dur) if dur else 180
+
+    return search_and_export(
+        q=q,
+        max_results=n,
+        days=days,
+        order="views",
+        shorts_only=True,
+        max_duration_sec=dur,
+        auto_sheet=True
+    )
