@@ -1,4 +1,4 @@
-# app.py — YouTube Shorts Analyzer (v1.2 완성본)
+# app.py — YouTube Shorts Analyzer (v1.3, 쇼츠 길이 가변)
 from fastapi import FastAPI, Query, Body, HTTPException
 from typing import List, Dict, Any, Union
 from datetime import datetime, timedelta
@@ -69,13 +69,20 @@ def search_shorts(
     max_results: int = Query(100, ge=1, le=200),
     days: int = Query(90, ge=1, le=180),
     order: str = Query("views"),
-    shorts_only: bool = Query(True, description="쇼츠만 보기(≤180초)")
+    shorts_only: bool = Query(True, description="쇼츠만 보기(길이 제한 적용)"),
+    max_duration_sec: int = Query(180, ge=1, le=600, description="쇼츠로 인정할 최대 길이(초), 기본 180")
 ):
+    """
+    쇼츠 판별 로직:
+    - shorts_only = True 일 때, durationSec <= max_duration_sec 인 영상만 반환
+    - 기본값 180초(3분)
+    """
     yt = get_youtube()
     published_after = (datetime.utcnow() - timedelta(days=days)).isoformat("T") + "Z"
     order_api = ORDER_MAP.get(order, "viewCount")
 
-    video_ids = []
+    # 1) 검색으로 videoId 모으기
+    video_ids: List[str] = []
     next_page_token = None
     while len(video_ids) < max_results:
         resp = yt.search().list(
@@ -95,15 +102,15 @@ def search_shorts(
     if not video_ids:
         return {"keyword": q, "count": 0, "videos": []}
 
-    # 세부 정보 조회
-    videos = []
+    # 2) 세부 정보 조회 + 길이 필터
+    videos: List[Dict[str, Any]] = []
     for i in range(0, len(video_ids), 50):
         chunk = ",".join(video_ids[i:i+50])
         vresp = yt.videos().list(id=chunk, part="snippet,contentDetails,statistics").execute()
 
         for v in vresp.get("items", []):
             dur = isodate.parse_duration(v["contentDetails"]["duration"]).total_seconds()
-            if shorts_only and dur > 180:
+            if shorts_only and dur > max_duration_sec:
                 continue
             videos.append({
                 "videoId": v["id"],
@@ -121,9 +128,9 @@ def search_shorts(
     if not videos:
         return {"keyword": q, "count": 0, "videos": []}
 
-    # 채널 구독자 수 조회
+    # 3) 채널 구독자 수 조회
     ch_ids = sorted({v["channelId"] for v in videos})
-    subs_map = {}
+    subs_map: Dict[str, Any] = {}
     for i in range(0, len(ch_ids), 50):
         chunk = ",".join(ch_ids[i:i+50])
         cresp = yt.channels().list(id=chunk, part="statistics").execute()
@@ -131,6 +138,7 @@ def search_shorts(
             s = c.get("statistics", {})
             subs_map[c["id"]] = None if s.get("hiddenSubscriberCount") else int(s.get("subscriberCount", 0))
 
+    # 4) 계산 필드 추가
     for v in videos:
         sub = subs_map.get(v["channelId"])
         v["subscriberCount"] = sub
@@ -141,8 +149,15 @@ def search_shorts(
             v["viewsPerSub"] = None
             v["likesPerSub"] = None
 
+    # 5) 기본 정렬(조회수 내림차순)
     videos.sort(key=lambda x: x["viewCount"], reverse=True)
-    return {"keyword": q, "count": len(videos), "videos": videos}
+    return {
+        "keyword": q,
+        "count": len(videos),
+        "shorts_only": shorts_only,
+        "max_duration_sec": max_duration_sec,
+        "videos": videos
+    }
 
 # =========================
 # 2️⃣ Google Sheets 업로드 (rows / videos / 배열 모두 지원)
