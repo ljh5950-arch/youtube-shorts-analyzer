@@ -307,8 +307,8 @@ def quick(
         if _dur: duration = _dur
 
     q = q or "검색결과"
-    n = n or 100
-    days = days or 90
+    n = n or 50
+    days = days or 14
     duration = duration or 180
 
     return search_and_export(
